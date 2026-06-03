@@ -8,7 +8,17 @@ from google import genai
 from google.genai import types
 
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAMES = ["gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-2.5-flash"]
+ALLOWED_STATUSES = {"Verified", "Inaccurate", "False"}
+CHECKABLE_VALUE_PATTERN = re.compile(
+    r"(\d|%|\$|₹|€|£|billion|million|trillion|crore|lakh|revenue|users|market share|growth|founded|launched)",
+    re.IGNORECASE,
+)
+INSTRUCTION_PATTERN = re.compile(
+    r"(build|design|define|submit|submission|deliverable|upload|interface|deployment|mandatory|"
+    r"requirements?|criteria|roadmap|task|objective|ppt|github|demo video|streamlit|gradio|react|vercel|render)",
+    re.IGNORECASE,
+)
 
 
 st.set_page_config(
@@ -85,6 +95,26 @@ def get_client(api_key: str) -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
+def generate_content_with_fallback(client: genai.Client, contents: str, config):
+    last_error = None
+    for model_name in MODEL_NAMES:
+        try:
+            return client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config,
+            )
+        except Exception as exc:
+            last_error = exc
+            error_text = str(exc)
+            if "RESOURCE_EXHAUSTED" not in error_text and "429" not in error_text:
+                raise
+    raise RuntimeError(
+        "Gemini free quota is exhausted for today. Please wait for the daily reset, "
+        "use another Gemini API key/project, or enable billing for higher limits."
+    ) from last_error
+
+
 def extract_text_from_pdf(pdf_file) -> str:
     reader = PyPDF2.PdfReader(pdf_file)
     pages = []
@@ -117,14 +147,19 @@ Focus only on claims that can be checked externally:
 - market, financial, technical, or scientific figures
 - named factual statements
 
+Do not extract:
+- goals, tasks, objectives, or roadmap items
+- recommendations or opinions
+- generic statements without a concrete factual value
+
 Return only a JSON array. Each item must use this schema:
 {{"claim": "...", "context": "...", "why_checkable": "..."}}
 
 PDF text:
 {text[:12000]}
 """
-    response = client.models.generate_content(
-        model=MODEL_NAME,
+    response = generate_content_with_fallback(
+        client=client,
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0.1,
@@ -132,7 +167,18 @@ PDF text:
         ),
     )
     claims = parse_json(response.text or "[]")
-    return claims if isinstance(claims, list) else []
+    if not isinstance(claims, list):
+        return []
+    return [claim for claim in claims if is_checkable_claim(claim.get("claim", ""))]
+
+
+def is_checkable_claim(claim: str) -> bool:
+    claim = (claim or "").strip()
+    if not claim:
+        return False
+    if INSTRUCTION_PATTERN.search(claim):
+        return False
+    return bool(CHECKABLE_VALUE_PATTERN.search(claim))
 
 
 def grounding_sources(response) -> list[dict]:
@@ -177,6 +223,8 @@ Classify each claim as:
 - Inaccurate: the claim is partly true, outdated, or the number/date is wrong.
 - False: no reliable evidence supports it, or reliable sources contradict it.
 
+If a provided item is not an externally verifiable factual claim, mark it as False and explain that it is not checkable evidence.
+
 Return only a JSON array. Each item must use this schema:
 {{
   "id": 1,
@@ -185,8 +233,8 @@ Return only a JSON array. Each item must use this schema:
   "correct_fact": "correct current fact if available, otherwise N/A"
 }}
 """
-    response = client.models.generate_content(
-        model=MODEL_NAME,
+    response = generate_content_with_fallback(
+        client=client,
         contents=prompt,
         config=types.GenerateContentConfig(
             tools=[grounding_tool],
@@ -198,6 +246,11 @@ Return only a JSON array. Each item must use this schema:
     if not isinstance(results, list):
         results = []
     return results, grounding_sources(response)
+
+
+def normalize_status(status: str) -> str:
+    status = (status or "").strip()
+    return status if status in ALLOWED_STATUSES else "False"
 
 
 def render_result(result: dict) -> None:
@@ -283,6 +336,7 @@ if analyze_btn:
                     "correct_fact": "N/A",
                 }
             verification.pop("id", None)
+            verification["status"] = normalize_status(verification.get("status", "False"))
             results.append({**claim_obj, **verification, "sources": shared_sources})
 
         verified = sum(1 for item in results if item.get("status") == "Verified")
