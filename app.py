@@ -272,3 +272,4 @@ if analyze_btn:
                     {"<br><strong>Correct Fact:</strong> " + r.get('correct_fact', '') if r.get('correct_fact') and r.get('correct_fact') != 'N/A' else ''}
                 </div>
                 """, unsafe_allow_html=True)
+                
