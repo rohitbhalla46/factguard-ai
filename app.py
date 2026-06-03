@@ -1,9 +1,7 @@
 import streamlit as st
-import anthropic
 import requests
 import json
 import PyPDF2
-import io
 import os
 
 # Page config
@@ -110,11 +108,15 @@ st.markdown("""
 # Sidebar for API keys
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
-    anthropic_key = st.text_input("Anthropic API Key", type="password", placeholder="sk-ant-...")
+    gemini_key = st.text_input("Gemini API Key", type="password", placeholder="AIza...")
     serper_key = st.text_input("Serper API Key", type="password", placeholder="your-serper-key")
     st.markdown("---")
     st.markdown("### How it works")
     st.markdown("1. 📄 Upload PDF\n2. 🤖 AI extracts claims\n3. 🌐 Web verifies each claim\n4. ✅ Get detailed report")
+    st.markdown("---")
+    st.markdown("### Get Free API Keys")
+    st.markdown("🔑 [Gemini API Key](https://aistudio.google.com/apikey) (Free)")
+    st.markdown("🔑 [Serper API Key](https://serper.dev) (Free tier)")
 
 def extract_text_from_pdf(pdf_file):
     pdf_reader = PyPDF2.PdfReader(pdf_file)
@@ -123,22 +125,25 @@ def extract_text_from_pdf(pdf_file):
         text += page.extract_text() + "\n"
     return text
 
-def extract_claims(text, api_key):
-    client = anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1000,
-        messages=[{
-            "role": "user",
-            "content": f"""Extract all specific factual claims from this text that can be verified. 
+def extract_claims_gemini(text, api_key):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    
+    prompt = f"""Extract all specific factual claims from this text that can be verified. 
 Focus on: statistics, dates, numbers, financial figures, scientific facts, historical events.
 Return ONLY a JSON array of claims like: [{{"claim": "...", "context": "..."}}]
-No explanation, just JSON.
+No explanation, just JSON. No markdown code blocks.
 
 Text: {text[:3000]}"""
-        }]
-    )
-    raw = response.content[0].text.strip()
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1000}
+    }
+    
+    response = requests.post(url, json=payload)
+    result = response.json()
+    
+    raw = result["candidates"][0]["content"]["parts"][0]["text"].strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
@@ -153,14 +158,10 @@ def search_web(claim, serper_key):
         snippets.append(f"{r.get('title','')}: {r.get('snippet','')}")
     return "\n".join(snippets)
 
-def verify_claim(claim, context, search_results, api_key):
-    client = anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1000,
-        messages=[{
-            "role": "user",
-            "content": f"""Verify this claim using the web search results provided.
+def verify_claim_gemini(claim, context, search_results, api_key):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    
+    prompt = f"""Verify this claim using the web search results provided.
 
 Claim: {claim}
 Context: {context}
@@ -168,15 +169,22 @@ Context: {context}
 Web Search Results:
 {search_results}
 
-Respond ONLY in JSON:
+Respond ONLY in JSON (no markdown, no code blocks):
 {{
   "status": "Verified" or "Inaccurate" or "False",
   "explanation": "brief explanation",
   "correct_fact": "what the correct fact is (if inaccurate/false)"
 }}"""
-        }]
-    )
-    raw = response.content[0].text.strip()
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 500}
+    }
+    
+    response = requests.post(url, json=payload)
+    result = response.json()
+    
+    raw = result["candidates"][0]["content"]["parts"][0]["text"].strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
@@ -191,7 +199,7 @@ with col2:
     analyze_btn = st.button("🚀 Analyze Document", use_container_width=True, type="primary")
 
 if analyze_btn:
-    if not anthropic_key or not serper_key:
+    if not gemini_key or not serper_key:
         st.error("⚠️ Please enter both API keys in the sidebar!")
     elif not uploaded_file:
         st.error("⚠️ Please upload a PDF file!")
@@ -202,7 +210,7 @@ if analyze_btn:
 
         with st.spinner("🤖 AI is identifying claims..."):
             try:
-                claims = extract_claims(text, anthropic_key)
+                claims = extract_claims_gemini(text, gemini_key)
                 st.success(f"✅ Found {len(claims)} verifiable claims")
             except Exception as e:
                 st.error(f"Error extracting claims: {e}")
@@ -213,15 +221,15 @@ if analyze_btn:
             progress = st.progress(0)
             status_text = st.empty()
 
-            for i, claim_obj in enumerate(claims[:8]):  # limit to 8 claims
+            for i, claim_obj in enumerate(claims[:8]):
                 status_text.text(f"🌐 Verifying claim {i+1}/{min(len(claims), 8)}...")
                 try:
                     search_results = search_web(claim_obj['claim'], serper_key)
-                    verification = verify_claim(
+                    verification = verify_claim_gemini(
                         claim_obj['claim'],
                         claim_obj.get('context', ''),
                         search_results,
-                        anthropic_key
+                        gemini_key
                     )
                     results.append({**claim_obj, **verification})
                 except Exception as e:
