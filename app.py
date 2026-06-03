@@ -1,275 +1,294 @@
-import streamlit as st
-import requests
 import json
-import PyPDF2
 import os
+import re
 
-# Page config
+import PyPDF2
+import streamlit as st
+from google import genai
+from google.genai import types
+
+
+MODEL_NAME = "gemini-2.5-flash"
+
+
 st.set_page_config(
     page_title="FactGuard AI",
-    page_icon="🔍",
-    layout="wide"
+    page_icon="FG",
+    layout="wide",
 )
 
-# Custom CSS
-st.markdown("""
+st.markdown(
+    """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-
-* { font-family: 'Space Grotesk', sans-serif; }
-
-.main { background: #0a0a0f; }
-.stApp { background: #0a0a0f; color: #e8e8f0; }
-
+* { font-family: Inter, Segoe UI, sans-serif; }
+.stApp { background: #0b0f14; color: #eef3f8; }
 .hero {
-    text-align: center;
-    padding: 2rem 0;
-    background: linear-gradient(135deg, #0a0a0f 0%, #1a0a2e 50%, #0a0a0f 100%);
-    border-radius: 16px;
-    margin-bottom: 2rem;
-    border: 1px solid #2a2a4a;
+    padding: 1.25rem 0 1.75rem;
+    border-bottom: 1px solid #23303d;
+    margin-bottom: 1.5rem;
 }
-
 .hero h1 {
-    font-size: 3rem;
-    font-weight: 700;
-    background: linear-gradient(90deg, #7c3aed, #06b6d4, #7c3aed);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
+    font-size: 2.45rem;
+    font-weight: 750;
     margin: 0;
+    letter-spacing: 0;
 }
-
 .hero p {
-    color: #8888aa;
-    font-size: 1.1rem;
-    margin-top: 0.5rem;
+    color: #aab7c4;
+    font-size: 1rem;
+    margin-top: .35rem;
 }
-
 .claim-card {
-    border-radius: 12px;
-    padding: 1.2rem 1.5rem;
-    margin: 0.8rem 0;
-    border-left: 4px solid;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.9rem;
+    border-radius: 8px;
+    padding: 1rem 1.1rem;
+    margin: .75rem 0;
+    border: 1px solid #2b3948;
+    background: #111820;
 }
-
-.verified {
-    background: #052e16;
-    border-color: #22c55e;
-    color: #86efac;
-}
-
-.inaccurate {
-    background: #431407;
-    border-color: #f97316;
-    color: #fdba74;
-}
-
-.false {
-    background: #3f0a0a;
-    border-color: #ef4444;
-    color: #fca5a5;
-}
-
-.badge {
+.status {
     display: inline-block;
-    padding: 0.2rem 0.8rem;
-    border-radius: 20px;
-    font-size: 0.75rem;
-    font-weight: 600;
-    margin-bottom: 0.5rem;
+    padding: .18rem .55rem;
+    border-radius: 999px;
+    font-size: .75rem;
+    font-weight: 700;
+    margin-bottom: .55rem;
 }
-
-.badge-verified { background: #22c55e22; color: #22c55e; border: 1px solid #22c55e44; }
-.badge-inaccurate { background: #f9731622; color: #f97316; border: 1px solid #f9731644; }
-.badge-false { background: #ef444422; color: #ef4444; border: 1px solid #ef444444; }
-
-.stats-box {
-    background: #12121f;
-    border: 1px solid #2a2a4a;
-    border-radius: 12px;
-    padding: 1.5rem;
-    text-align: center;
-}
-
-.stats-number { font-size: 2rem; font-weight: 700; }
+.verified { color: #65d98b; border-color: #245b39; }
+.inaccurate { color: #f2b35d; border-color: #795324; }
+.false { color: #ff7979; border-color: #793030; }
+.source-list a { color: #8ed0ff; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# Hero section
-st.markdown("""
+st.markdown(
+    """
 <div class="hero">
-    <h1>🔍 FactGuard AI</h1>
-    <p>Upload a PDF → Extract Claims → Verify Against Live Web Data</p>
+  <h1>FactGuard AI</h1>
+  <p>Upload a PDF, extract verifiable claims, and check them against live Google Search grounding.</p>
 </div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# Sidebar for API keys
-with st.sidebar:
-    st.markdown("### ⚙️ Configuration")
-    gemini_key = st.text_input("Gemini API Key", type="password", placeholder="AIza...")
-    serper_key = st.text_input("Serper API Key", type="password", placeholder="your-serper-key")
-    st.markdown("---")
-    st.markdown("### How it works")
-    st.markdown("1. 📄 Upload PDF\n2. 🤖 AI extracts claims\n3. 🌐 Web verifies each claim\n4. ✅ Get detailed report")
-    st.markdown("---")
-    st.markdown("### Get Free API Keys")
-    st.markdown("🔑 [Gemini API Key](https://aistudio.google.com/apikey) (Free)")
-    st.markdown("🔑 [Serper API Key](https://serper.dev) (Free tier)")
 
-def extract_text_from_pdf(pdf_file):
-    pdf_reader = PyPDF2.PdfReader(pdf_file)
-    text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text() + "\n"
-    return text
+def get_secret(name: str) -> str:
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        value = ""
+    return value or os.getenv(name, "")
 
-def extract_claims_gemini(text, api_key):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
-    
-    prompt = f"""Extract all specific factual claims from this text that can be verified. 
-Focus on: statistics, dates, numbers, financial figures, scientific facts, historical events.
-Return ONLY a JSON array of claims like: [{{"claim": "...", "context": "..."}}]
-No explanation, just JSON. No markdown code blocks.
 
-Text: {text[:3000]}"""
+def get_client(api_key: str) -> genai.Client:
+    return genai.Client(api_key=api_key)
 
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1000}
-    }
-    
-    response = requests.post(url, json=payload)
-    result = response.json()
-    
-    raw = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
 
-def search_web(claim, serper_key):
-    url = "https://google.serper.dev/search"
-    headers = {"X-API-KEY": serper_key, "Content-Type": "application/json"}
-    data = {"q": claim, "num": 3}
-    response = requests.post(url, headers=headers, json=data)
-    results = response.json()
-    snippets = []
-    for r in results.get("organic", [])[:3]:
-        snippets.append(f"{r.get('title','')}: {r.get('snippet','')}")
-    return "\n".join(snippets)
+def extract_text_from_pdf(pdf_file) -> str:
+    reader = PyPDF2.PdfReader(pdf_file)
+    pages = []
+    for page in reader.pages:
+        pages.append(page.extract_text() or "")
+    return "\n".join(pages).strip()
 
-def verify_claim_gemini(claim, context, search_results, api_key):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
-    
-    prompt = f"""Verify this claim using the web search results provided.
+
+def parse_json(raw: str):
+    raw = raw.strip()
+    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"(\[.*\]|\{.*\})", raw, re.DOTALL)
+        if not match:
+            raise
+        return json.loads(match.group(1))
+
+
+def extract_claims(text: str, api_key: str) -> list[dict]:
+    client = get_client(api_key)
+    prompt = f"""
+Extract specific factual claims from this PDF text.
+
+Focus only on claims that can be checked externally:
+- statistics and percentages
+- dates and timelines
+- market, financial, technical, or scientific figures
+- named factual statements
+
+Return only a JSON array. Each item must use this schema:
+{{"claim": "...", "context": "...", "why_checkable": "..."}}
+
+PDF text:
+{text[:12000]}
+"""
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json",
+        ),
+    )
+    claims = parse_json(response.text or "[]")
+    return claims if isinstance(claims, list) else []
+
+
+def grounding_sources(response) -> list[dict]:
+    sources = []
+    try:
+        metadata = response.candidates[0].grounding_metadata
+        chunks = metadata.grounding_chunks or []
+    except Exception:
+        return sources
+
+    for chunk in chunks:
+        web = getattr(chunk, "web", None)
+        if not web:
+            continue
+        title = getattr(web, "title", "") or "Source"
+        uri = getattr(web, "uri", "") or ""
+        if uri and not any(item["uri"] == uri for item in sources):
+            sources.append({"title": title, "uri": uri})
+    return sources[:5]
+
+
+def verify_claim(claim: str, context: str, api_key: str) -> dict:
+    client = get_client(api_key)
+    grounding_tool = types.Tool(google_search=types.GoogleSearch())
+
+    prompt = f"""
+Use live Google Search grounding to verify the claim below.
 
 Claim: {claim}
-Context: {context}
+Context from PDF: {context}
 
-Web Search Results:
-{search_results}
+Classify the claim as:
+- Verified: reliable current sources support the claim.
+- Inaccurate: the claim is partly true, outdated, or the number/date is wrong.
+- False: no reliable evidence supports it, or reliable sources contradict it.
 
-Respond ONLY in JSON (no markdown, no code blocks):
+Return only JSON:
 {{
-  "status": "Verified" or "Inaccurate" or "False",
-  "explanation": "brief explanation",
-  "correct_fact": "what the correct fact is (if inaccurate/false)"
-}}"""
+  "status": "Verified" | "Inaccurate" | "False",
+  "explanation": "short reason based on the sources",
+  "correct_fact": "correct current fact if available, otherwise N/A"
+}}
+"""
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            tools=[grounding_tool],
+            temperature=0.0,
+        ),
+    )
 
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 500}
-    }
-    
-    response = requests.post(url, json=payload)
-    result = response.json()
-    
-    raw = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    result = parse_json(response.text or "{}")
+    if not isinstance(result, dict):
+        result = {
+            "status": "False",
+            "explanation": "Gemini returned an unexpected verification format.",
+            "correct_fact": "N/A",
+        }
+    result["sources"] = grounding_sources(response)
+    return result
 
-# Main UI
-col1, col2 = st.columns([2, 1])
 
-with col1:
-    uploaded_file = st.file_uploader("📄 Upload PDF Document", type=['pdf'])
+def render_result(result: dict) -> None:
+    status = result.get("status", "False")
+    css_class = status.lower()
+    sources = result.get("sources", [])
+    source_html = ""
+    if sources:
+        links = "".join(
+            f'<li><a href="{s["uri"]}" target="_blank">{s["title"]}</a></li>'
+            for s in sources
+        )
+        source_html = f'<div class="source-list"><strong>Sources:</strong><ul>{links}</ul></div>'
 
-with col2:
-    st.markdown("<br>", unsafe_allow_html=True)
-    analyze_btn = st.button("🚀 Analyze Document", use_container_width=True, type="primary")
+    st.markdown(
+        f"""
+<div class="claim-card {css_class}">
+  <span class="status {css_class}">{status}</span><br>
+  <strong>Claim:</strong> {result.get("claim", "N/A")}<br><br>
+  <strong>Finding:</strong> {result.get("explanation", "N/A")}<br>
+  <strong>Correct fact:</strong> {result.get("correct_fact", "N/A")}
+  {source_html}
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+with st.sidebar:
+    st.subheader("Configuration")
+    default_key = get_secret("GEMINI_API_KEY")
+    gemini_key = st.text_input(
+        "Gemini API Key",
+        value=default_key,
+        type="password",
+        placeholder="Set GEMINI_API_KEY in Streamlit secrets",
+    )
+    max_claims = st.slider("Claims to verify", min_value=3, max_value=12, value=8)
+
+uploaded_file = st.file_uploader("Upload PDF document", type=["pdf"])
+analyze_btn = st.button("Analyze document", type="primary", use_container_width=True)
 
 if analyze_btn:
-    if not gemini_key or not serper_key:
-        st.error("⚠️ Please enter both API keys in the sidebar!")
-    elif not uploaded_file:
-        st.error("⚠️ Please upload a PDF file!")
-    else:
-        with st.spinner("📄 Extracting text from PDF..."):
+    if not gemini_key:
+        st.error("Add your Gemini key in the sidebar or Streamlit Cloud secrets as GEMINI_API_KEY.")
+        st.stop()
+    if not uploaded_file:
+        st.error("Upload a PDF first.")
+        st.stop()
+
+    try:
+        with st.spinner("Extracting text from PDF..."):
             text = extract_text_from_pdf(uploaded_file)
-            st.success(f"✅ Extracted {len(text)} characters from PDF")
+        if not text:
+            st.error("No readable text found in this PDF. Try a text-based PDF instead of a scanned image.")
+            st.stop()
+        st.success(f"Extracted {len(text):,} characters.")
 
-        with st.spinner("🤖 AI is identifying claims..."):
-            try:
-                claims = extract_claims_gemini(text, gemini_key)
-                st.success(f"✅ Found {len(claims)} verifiable claims")
-            except Exception as e:
-                st.error(f"Error extracting claims: {e}")
-                claims = []
+        with st.spinner("Extracting checkable claims..."):
+            claims = extract_claims(text, gemini_key)
+        claims = claims[:max_claims]
+        st.success(f"Found {len(claims)} claims to verify.")
 
-        if claims:
-            results = []
-            progress = st.progress(0)
-            status_text = st.empty()
+        if not claims:
+            st.info("No checkable claims were found.")
+            st.stop()
 
-            for i, claim_obj in enumerate(claims[:8]):
-                status_text.text(f"🌐 Verifying claim {i+1}/{min(len(claims), 8)}...")
-                try:
-                    search_results = search_web(claim_obj['claim'], serper_key)
-                    verification = verify_claim_gemini(
-                        claim_obj['claim'],
-                        claim_obj.get('context', ''),
-                        search_results,
-                        gemini_key
-                    )
-                    results.append({**claim_obj, **verification})
-                except Exception as e:
-                    results.append({
-                        **claim_obj,
-                        "status": "False",
-                        "explanation": f"Could not verify: {str(e)}",
-                        "correct_fact": "N/A"
-                    })
-                progress.progress((i + 1) / min(len(claims), 8))
+        results = []
+        progress = st.progress(0)
+        for index, claim_obj in enumerate(claims, start=1):
+            with st.spinner(f"Verifying claim {index}/{len(claims)}..."):
+                claim = claim_obj.get("claim", "")
+                verification = verify_claim(claim, claim_obj.get("context", ""), gemini_key)
+                results.append({**claim_obj, **verification})
+            progress.progress(index / len(claims))
 
-            status_text.text("✅ Analysis complete!")
+        verified = sum(1 for item in results if item.get("status") == "Verified")
+        inaccurate = sum(1 for item in results if item.get("status") == "Inaccurate")
+        false = sum(1 for item in results if item.get("status") == "False")
 
-            # Stats
-            verified = sum(1 for r in results if r['status'] == 'Verified')
-            inaccurate = sum(1 for r in results if r['status'] == 'Inaccurate')
-            false = sum(1 for r in results if r['status'] == 'False')
+        st.subheader("Summary")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Verified", verified)
+        col2.metric("Inaccurate", inaccurate)
+        col3.metric("False", false)
 
-            st.markdown("### 📊 Summary")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.markdown(f"""<div class="stats-box"><div class="stats-number" style="color:#22c55e">{verified}</div><div>Verified</div></div>""", unsafe_allow_html=True)
-            with c2:
-                st.markdown(f"""<div class="stats-box"><div class="stats-number" style="color:#f97316">{inaccurate}</div><div>Inaccurate</div></div>""", unsafe_allow_html=True)
-            with c3:
-                st.markdown(f"""<div class="stats-box"><div class="stats-number" style="color:#ef4444">{false}</div><div>False</div></div>""", unsafe_allow_html=True)
+        st.subheader("Detailed Results")
+        for result in results:
+            render_result(result)
 
-            st.markdown("### 📋 Detailed Results")
-            for r in results:
-                status = r.get('status', 'False')
-                css_class = status.lower()
-                badge_class = f"badge-{css_class}"
-                emoji = "✅" if status == "Verified" else "⚠️" if status == "Inaccurate" else "❌"
-
-                st.markdown(f"""
-                <div class="claim-card {css_class}">
-                    <span class="badge {badge_class}">{emoji} {status}</span><br>
-                    <strong>Claim:</strong> {r['claim']}<br><br>
-                    <strong>Finding:</strong> {r.get('explanation', 'N/A')}<br>
-                    {"<br><strong>Correct Fact:</strong> " + r.get('correct_fact', '') if r.get('correct_fact') and r.get('correct_fact') != 'N/A' else ''}
-                </div>
-                """, unsafe_allow_html=True)
-                
+        st.download_button(
+            "Download JSON report",
+            data=json.dumps(results, indent=2),
+            file_name="factguard_report.json",
+            mime="application/json",
+        )
+    except Exception as exc:
+        st.exception(exc)
