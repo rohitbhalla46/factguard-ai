@@ -154,23 +154,32 @@ def grounding_sources(response) -> list[dict]:
     return sources[:5]
 
 
-def verify_claim(claim: str, context: str, api_key: str) -> dict:
+def verify_claims(claims: list[dict], api_key: str) -> tuple[list[dict], list[dict]]:
     client = get_client(api_key)
     grounding_tool = types.Tool(google_search=types.GoogleSearch())
+    claim_payload = [
+        {
+            "id": index,
+            "claim": claim.get("claim", ""),
+            "context": claim.get("context", ""),
+        }
+        for index, claim in enumerate(claims, start=1)
+    ]
 
     prompt = f"""
-Use live Google Search grounding to verify the claim below.
+Use live Google Search grounding to verify all claims below.
 
-Claim: {claim}
-Context from PDF: {context}
+Claims:
+{json.dumps(claim_payload, indent=2)}
 
-Classify the claim as:
+Classify each claim as:
 - Verified: reliable current sources support the claim.
 - Inaccurate: the claim is partly true, outdated, or the number/date is wrong.
 - False: no reliable evidence supports it, or reliable sources contradict it.
 
-Return only JSON:
+Return only a JSON array. Each item must use this schema:
 {{
+  "id": 1,
   "status": "Verified" | "Inaccurate" | "False",
   "explanation": "short reason based on the sources",
   "correct_fact": "correct current fact if available, otherwise N/A"
@@ -185,15 +194,10 @@ Return only JSON:
         ),
     )
 
-    result = parse_json(response.text or "{}")
-    if not isinstance(result, dict):
-        result = {
-            "status": "False",
-            "explanation": "Gemini returned an unexpected verification format.",
-            "correct_fact": "N/A",
-        }
-    result["sources"] = grounding_sources(response)
-    return result
+    results = parse_json(response.text or "[]")
+    if not isinstance(results, list):
+        results = []
+    return results, grounding_sources(response)
 
 
 def render_result(result: dict) -> None:
@@ -231,7 +235,7 @@ with st.sidebar:
         type="password",
         placeholder="Set GEMINI_API_KEY in Streamlit secrets",
     )
-    max_claims = st.slider("Claims to verify", min_value=3, max_value=12, value=8)
+    max_claims = st.slider("Claims to verify", min_value=3, max_value=8, value=5)
 
 uploaded_file = st.file_uploader("Upload PDF document", type=["pdf"])
 analyze_btn = st.button("Analyze document", type="primary", use_container_width=True)
@@ -261,14 +265,25 @@ if analyze_btn:
             st.info("No checkable claims were found.")
             st.stop()
 
-        results = []
         progress = st.progress(0)
+        with st.spinner("Verifying claims against live web data..."):
+            verifications, shared_sources = verify_claims(claims, gemini_key)
+        progress.progress(1.0)
+
+        verification_by_id = {
+            item.get("id"): item for item in verifications if isinstance(item, dict)
+        }
+        results = []
         for index, claim_obj in enumerate(claims, start=1):
-            with st.spinner(f"Verifying claim {index}/{len(claims)}..."):
-                claim = claim_obj.get("claim", "")
-                verification = verify_claim(claim, claim_obj.get("context", ""), gemini_key)
-                results.append({**claim_obj, **verification})
-            progress.progress(index / len(claims))
+            verification = verification_by_id.get(index, {})
+            if not verification:
+                verification = {
+                    "status": "False",
+                    "explanation": "No verification result was returned for this claim.",
+                    "correct_fact": "N/A",
+                }
+            verification.pop("id", None)
+            results.append({**claim_obj, **verification, "sources": shared_sources})
 
         verified = sum(1 for item in results if item.get("status") == "Verified")
         inaccurate = sum(1 for item in results if item.get("status") == "Inaccurate")
