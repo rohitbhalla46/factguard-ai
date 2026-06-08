@@ -8,10 +8,11 @@ from google import genai
 from google.genai import types
 
 
-MODEL_NAMES = ["gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-2.5-flash"]
+EXTRACTION_MODELS = ["gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-2.5-flash"]
+GROUNDING_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash"]
 ALLOWED_STATUSES = {"Verified", "Inaccurate", "False"}
 CHECKABLE_VALUE_PATTERN = re.compile(
-    r"(\d|%|\$|₹|€|£|billion|million|trillion|crore|lakh|revenue|users|market share|growth|founded|launched)",
+    r"(\d|%|\$|billion|million|trillion|crore|lakh|revenue|users|market share|growth|founded|launched|released|population|valuation)",
     re.IGNORECASE,
 )
 INSTRUCTION_PATTERN = re.compile(
@@ -21,11 +22,7 @@ INSTRUCTION_PATTERN = re.compile(
 )
 
 
-st.set_page_config(
-    page_title="FactGuard AI",
-    page_icon="FG",
-    layout="wide",
-)
+st.set_page_config(page_title="FactGuard AI", page_icon="FG", layout="wide")
 
 st.markdown(
     """
@@ -95,9 +92,26 @@ def get_client(api_key: str) -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
-def generate_content_with_fallback(client: genai.Client, contents: str, config):
+def is_retryable_model_error(error_text: str) -> bool:
+    retry_phrases = (
+        "RESOURCE_EXHAUSTED",
+        "429",
+        "not found",
+        "not supported",
+        "unsupported",
+        "INVALID_ARGUMENT",
+        "400",
+    )
+    return any(phrase.lower() in error_text.lower() for phrase in retry_phrases)
+
+
+def is_quota_error(error_text: str) -> bool:
+    return "RESOURCE_EXHAUSTED" in error_text or "429" in error_text or "quota" in error_text.lower()
+
+
+def generate_content_with_fallback(client: genai.Client, contents: str, config, models: list[str]):
     last_error = None
-    for model_name in MODEL_NAMES:
+    for model_name in models:
         try:
             return client.models.generate_content(
                 model=model_name,
@@ -106,12 +120,11 @@ def generate_content_with_fallback(client: genai.Client, contents: str, config):
             )
         except Exception as exc:
             last_error = exc
-            error_text = str(exc)
-            if "RESOURCE_EXHAUSTED" not in error_text and "429" not in error_text:
+            if not is_retryable_model_error(str(exc)):
                 raise
     raise RuntimeError(
-        "Gemini free quota is exhausted for today. Please wait for the daily reset, "
-        "use another Gemini API key/project, or enable billing for higher limits."
+        "Gemini quota/model limit hit. The app will keep working with a safe fallback, "
+        "but live verification may need a fresh API key, a new Google AI Studio project, or billing."
     ) from last_error
 
 
@@ -124,9 +137,8 @@ def extract_text_from_pdf(pdf_file) -> str:
 
 
 def parse_json(raw: str):
-    raw = raw.strip()
+    raw = (raw or "").strip()
     raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
@@ -136,7 +148,37 @@ def parse_json(raw: str):
         return json.loads(match.group(1))
 
 
-def extract_claims(text: str, api_key: str) -> list[dict]:
+def is_checkable_claim(claim: str) -> bool:
+    claim = (claim or "").strip()
+    if not claim:
+        return False
+    if INSTRUCTION_PATTERN.search(claim):
+        return False
+    return bool(CHECKABLE_VALUE_PATTERN.search(claim))
+
+
+def regex_extract_claims(text: str, limit: int = 8) -> list[dict]:
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
+    claims = []
+    for sentence in sentences:
+        sentence = " ".join(sentence.split())
+        if len(sentence) < 25:
+            continue
+        if not is_checkable_claim(sentence):
+            continue
+        claims.append(
+            {
+                "claim": sentence[:500],
+                "context": sentence[:500],
+                "why_checkable": "Contains a date, number, percentage, money amount, or measurable factual value.",
+            }
+        )
+        if len(claims) >= limit:
+            break
+    return claims
+
+
+def extract_claims(text: str, api_key: str, max_claims: int) -> tuple[list[dict], str | None]:
     client = get_client(api_key)
     prompt = f"""
 Extract specific factual claims from this PDF text.
@@ -148,7 +190,7 @@ Focus only on claims that can be checked externally:
 - named factual statements
 
 Do not extract:
-- goals, tasks, objectives, or roadmap items
+- goals, tasks, objectives, roadmap items, or submission instructions
 - recommendations or opinions
 - generic statements without a concrete factual value
 
@@ -158,27 +200,27 @@ Return only a JSON array. Each item must use this schema:
 PDF text:
 {text[:12000]}
 """
-    response = generate_content_with_fallback(
-        client=client,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.1,
-            response_mime_type="application/json",
-        ),
-    )
-    claims = parse_json(response.text or "[]")
-    if not isinstance(claims, list):
-        return []
-    return [claim for claim in claims if is_checkable_claim(claim.get("claim", ""))]
-
-
-def is_checkable_claim(claim: str) -> bool:
-    claim = (claim or "").strip()
-    if not claim:
-        return False
-    if INSTRUCTION_PATTERN.search(claim):
-        return False
-    return bool(CHECKABLE_VALUE_PATTERN.search(claim))
+    try:
+        response = generate_content_with_fallback(
+            client=client,
+            contents=prompt,
+            models=EXTRACTION_MODELS,
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                response_mime_type="application/json",
+            ),
+        )
+        claims = parse_json(response.text or "[]")
+        if not isinstance(claims, list):
+            claims = []
+        claims = [claim for claim in claims if is_checkable_claim(claim.get("claim", ""))]
+        return claims[:max_claims], None
+    except Exception as exc:
+        fallback_claims = regex_extract_claims(text, max_claims)
+        message = "AI extraction was unavailable, so the app used a local claim extractor."
+        if is_quota_error(str(exc)):
+            message = "Gemini quota is currently exhausted, so the app used a local claim extractor."
+        return fallback_claims, message
 
 
 def grounding_sources(response) -> list[dict]:
@@ -200,7 +242,7 @@ def grounding_sources(response) -> list[dict]:
     return sources[:5]
 
 
-def verify_claims(claims: list[dict], api_key: str) -> tuple[list[dict], list[dict]]:
+def verify_claims(claims: list[dict], api_key: str) -> tuple[list[dict], list[dict], str | None]:
     client = get_client(api_key)
     grounding_tool = types.Tool(google_search=types.GoogleSearch())
     claim_payload = [
@@ -223,8 +265,6 @@ Classify each claim as:
 - Inaccurate: the claim is partly true, outdated, or the number/date is wrong.
 - False: no reliable evidence supports it, or reliable sources contradict it.
 
-If a provided item is not an externally verifiable factual claim, mark it as False and explain that it is not checkable evidence.
-
 Return only a JSON array. Each item must use this schema:
 {{
   "id": 1,
@@ -233,19 +273,34 @@ Return only a JSON array. Each item must use this schema:
   "correct_fact": "correct current fact if available, otherwise N/A"
 }}
 """
-    response = generate_content_with_fallback(
-        client=client,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            tools=[grounding_tool],
-            temperature=0.0,
-        ),
-    )
-
-    results = parse_json(response.text or "[]")
-    if not isinstance(results, list):
-        results = []
-    return results, grounding_sources(response)
+    try:
+        response = generate_content_with_fallback(
+            client=client,
+            contents=prompt,
+            models=GROUNDING_MODELS,
+            config=types.GenerateContentConfig(
+                tools=[grounding_tool],
+                temperature=0.0,
+            ),
+        )
+        results = parse_json(response.text or "[]")
+        if not isinstance(results, list):
+            results = []
+        return results, grounding_sources(response), None
+    except Exception as exc:
+        message = "Live verification was unavailable. Showing extracted claims with a safe fallback status."
+        if is_quota_error(str(exc)):
+            message = "Gemini quota is currently exhausted. Showing extracted claims with a safe fallback status."
+        fallback_results = [
+            {
+                "id": index,
+                "status": "False",
+                "explanation": message,
+                "correct_fact": "Retry with available Gemini quota for the real fact.",
+            }
+            for index, _ in enumerate(claims, start=1)
+        ]
+        return fallback_results, [], message
 
 
 def normalize_status(status: str) -> str:
@@ -254,7 +309,7 @@ def normalize_status(status: str) -> str:
 
 
 def render_result(result: dict) -> None:
-    status = result.get("status", "False")
+    status = normalize_status(result.get("status", "False"))
     css_class = status.lower()
     sources = result.get("sources", [])
     source_html = ""
@@ -301,63 +356,68 @@ if analyze_btn:
         st.error("Upload a PDF first.")
         st.stop()
 
-    try:
-        with st.spinner("Extracting text from PDF..."):
+    with st.spinner("Extracting text from PDF..."):
+        try:
             text = extract_text_from_pdf(uploaded_file)
-        if not text:
-            st.error("No readable text found in this PDF. Try a text-based PDF instead of a scanned image.")
-            st.stop()
-        st.success(f"Extracted {len(text):,} characters.")
-
-        with st.spinner("Extracting checkable claims..."):
-            claims = extract_claims(text, gemini_key)
-        claims = claims[:max_claims]
-        st.success(f"Found {len(claims)} claims to verify.")
-
-        if not claims:
-            st.info("No checkable claims were found.")
+        except Exception as exc:
+            st.error(f"Could not read this PDF: {exc}")
             st.stop()
 
-        progress = st.progress(0)
-        with st.spinner("Verifying claims against live web data..."):
-            verifications, shared_sources = verify_claims(claims, gemini_key)
-        progress.progress(1.0)
+    if not text:
+        st.error("No readable text found in this PDF. Try a text-based PDF instead of a scanned image.")
+        st.stop()
+    st.success(f"Extracted {len(text):,} characters.")
 
-        verification_by_id = {
-            item.get("id"): item for item in verifications if isinstance(item, dict)
-        }
-        results = []
-        for index, claim_obj in enumerate(claims, start=1):
-            verification = verification_by_id.get(index, {})
-            if not verification:
-                verification = {
-                    "status": "False",
-                    "explanation": "No verification result was returned for this claim.",
-                    "correct_fact": "N/A",
-                }
-            verification.pop("id", None)
-            verification["status"] = normalize_status(verification.get("status", "False"))
-            results.append({**claim_obj, **verification, "sources": shared_sources})
+    with st.spinner("Extracting checkable claims..."):
+        claims, extraction_warning = extract_claims(text, gemini_key, max_claims)
+    if extraction_warning:
+        st.warning(extraction_warning)
+    st.success(f"Found {len(claims)} claims to verify.")
 
-        verified = sum(1 for item in results if item.get("status") == "Verified")
-        inaccurate = sum(1 for item in results if item.get("status") == "Inaccurate")
-        false = sum(1 for item in results if item.get("status") == "False")
+    if not claims:
+        st.info("No checkable claims were found.")
+        st.stop()
 
-        st.subheader("Summary")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Verified", verified)
-        col2.metric("Inaccurate", inaccurate)
-        col3.metric("False", false)
+    progress = st.progress(0)
+    with st.spinner("Verifying claims against live web data..."):
+        verifications, shared_sources, verification_warning = verify_claims(claims, gemini_key)
+    progress.progress(1.0)
+    if verification_warning:
+        st.warning(verification_warning)
 
-        st.subheader("Detailed Results")
-        for result in results:
-            render_result(result)
+    verification_by_id = {
+        item.get("id"): item for item in verifications if isinstance(item, dict)
+    }
+    results = []
+    for index, claim_obj in enumerate(claims, start=1):
+        verification = verification_by_id.get(index, {})
+        if not verification:
+            verification = {
+                "status": "False",
+                "explanation": "No verification result was returned for this claim.",
+                "correct_fact": "N/A",
+            }
+        verification.pop("id", None)
+        verification["status"] = normalize_status(verification.get("status", "False"))
+        results.append({**claim_obj, **verification, "sources": shared_sources})
 
-        st.download_button(
-            "Download JSON report",
-            data=json.dumps(results, indent=2),
-            file_name="factguard_report.json",
-            mime="application/json",
-        )
-    except Exception as exc:
-        st.exception(exc)
+    verified = sum(1 for item in results if item.get("status") == "Verified")
+    inaccurate = sum(1 for item in results if item.get("status") == "Inaccurate")
+    false = sum(1 for item in results if item.get("status") == "False")
+
+    st.subheader("Summary")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Verified", verified)
+    col2.metric("Inaccurate", inaccurate)
+    col3.metric("False", false)
+
+    st.subheader("Detailed Results")
+    for result in results:
+        render_result(result)
+
+    st.download_button(
+        "Download JSON report",
+        data=json.dumps(results, indent=2),
+        file_name="factguard_report.json",
+        mime="application/json",
+    )
